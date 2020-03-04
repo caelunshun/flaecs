@@ -1,0 +1,12 @@
+[package]
+name = "flaecs"
+version = "0.1.0"
+authors = ["Caelum van Ispelen <caelunshun@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+thiserror = "1.0"
+bitvec = "0.17"
+ahash = "0.3"
+erasable = "1.1"
+bitintr = "0.3"
