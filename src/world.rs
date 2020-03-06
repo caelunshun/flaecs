@@ -6,8 +6,9 @@ use bitvec::order::Local;
 use bitvec::vec::BitVec;
 use erasable::{Erasable, ErasedPtr};
 use std::any::TypeId;
-use std::iter;
-use std::mem::MaybeUninit;
+use std::cell::UnsafeCell;
+use std::ptr::NonNull;
+use std::{iter, ptr};
 use thiserror::Error;
 
 type StdResult<T, E> = std::result::Result<T, E>;
@@ -27,8 +28,14 @@ pub struct World {
     versions: Vec<u32>,
     /// Bit vector with bits set to 1 for entities that are alive.
     alive: BitVec<Local, usize>,
+    /// Set of free entity indices.
+    free: Vec<u32>,
     /// Mapping from component type IDs to pointers to component storages.
     components: AHashMap<TypeId, ErasedPtr>,
+    /// Next entity index to add.
+    entity_counter: u32,
+    /// Number of entities in the world.
+    num_entities: usize,
 }
 
 impl Default for World {
@@ -43,20 +50,23 @@ impl World {
             versions: vec![],
             alive: BitVec::new(),
             components: AHashMap::new(),
+            entity_counter: 0,
+            free: vec![],
+            num_entities: 0,
         }
     }
 
     pub fn spawn(&mut self, components: impl ComponentBundle) -> Entity {
-        let index = self
-            .alive
-            .iter()
-            .enumerate()
-            .find_map(|(i, x)| if !*x { Some(i) } else { None })
-            .unwrap_or_else(|| {
-                let index = self.versions.len();
+        let index = if self.free.is_empty() {
+            if self.entity_counter >= self.versions.len() as u32 {
                 self.alloc_more_entities();
-                index
-            }) as u32;
+            }
+            let i = self.entity_counter;
+            self.entity_counter += 1;
+            i
+        } else {
+            self.free.remove(0)
+        };
 
         self.versions[index as usize] += 1;
         self.alive.set(index as usize, true);
@@ -64,7 +74,11 @@ impl World {
 
         let entity = Entity { index, version };
 
-        components.add_to(self, entity);
+        components
+            .add_to(self, entity)
+            .expect("components failed to add");
+
+        self.num_entities += 1;
 
         entity
     }
@@ -72,6 +86,7 @@ impl World {
     pub fn despawn(&mut self, entity: Entity) -> Result<()> {
         self.check_valid_entity(entity)?;
         self.alive.set(entity.index as usize, false);
+        self.num_entities -= 1;
         Ok(())
     }
 
@@ -106,9 +121,10 @@ impl World {
     pub fn add<C: Component>(&mut self, entity: Entity, component: C) -> Result<()> {
         self.check_valid_entity(entity)?;
 
-        let storage = self
-            .component_storage_mut::<C>()
-            .ok_or(Error::ComponentNotFound)?;
+        let storage = match self.component_storage_mut::<C>() {
+            Some(storage) => storage,
+            None => self.create_new_storage(),
+        };
 
         storage.insert(entity.index as usize, component);
 
@@ -122,13 +138,23 @@ impl World {
             .component_storage_mut::<C>()
             .ok_or(Error::ComponentNotFound)?;
 
-        storage.remove(entity.index as usize);
+        if !storage.remove(entity.index as usize) {
+            return Err(Error::ComponentNotFound);
+        }
 
         Ok(())
     }
 
     pub fn size(&self) -> usize {
-        self.versions.len()
+        self.num_entities
+    }
+
+    pub fn clear(&mut self) {
+        self.versions.clear();
+        self.alive.clear();
+        // TODO: proper storage clear
+        self.components.clear();
+        self.num_entities = 0;
     }
 
     fn alloc_more_entities(&mut self) {
@@ -156,6 +182,17 @@ impl World {
             .get_mut(&TypeId::of::<C>())
             .map(|ptr| unsafe { &mut *ComponentStorage::<C>::unerase(*ptr).as_ptr() })
     }
+
+    fn create_new_storage<C: Component>(&mut self) -> &mut ComponentStorage<C> {
+        let storage = Box::new(ComponentStorage::<C>::new(self));
+
+        self.components.insert(
+            TypeId::of::<C>(),
+            erasable::erase(NonNull::new(Box::into_raw(storage)).unwrap()),
+        );
+
+        self.component_storage_mut().unwrap()
+    }
 }
 
 /// Stores components associated with entities.
@@ -170,24 +207,16 @@ struct ComponentStorage<T> {
     /// value in `sparse`, then the entity has this component, and the component
     /// is located at the same index in `data`.
     dense: Vec<u32>,
-    /// Stores free indices into `dense`. If none are avaible,
-    /// `dense` should be extended.
-    free: Vec<u32>,
     /// Raw component data.
-    data: Vec<MaybeUninit<T>>,
+    data: Vec<UnsafeCell<T>>,
 }
 
 impl<T> ComponentStorage<T> {
     fn new(world: &World) -> Self {
         Self {
             sparse: vec![std::u32::MAX; world.size()],
-            dense: vec![std::u32::MAX; world.size()],
-            free: iter::successors(Some(0), |x| Some(*x + 1))
-                .take(world.size())
-                .collect(),
-            data: iter::repeat_with(|| MaybeUninit::uninit())
-                .take(world.size())
-                .collect(),
+            dense: vec![],
+            data: vec![],
         }
     }
 
@@ -210,18 +239,18 @@ impl<T> ComponentStorage<T> {
         if entity_stored != index {
             None
         } else {
-            Some(self.data[dense_index].as_ptr() as *mut T)
+            Some(self.data[dense_index].get())
         }
     }
 
     fn insert(&mut self, index: usize, component: T) {
         self.extend_if_necessary(index);
 
-        let dense_index = self.find_new_dense_index();
+        let dense_index = self.dense.len() as u32;
+        self.dense.push(index as u32);
+        self.data.push(UnsafeCell::new(component));
 
         self.sparse[index] = dense_index;
-        self.dense[dense_index as usize] = index as u32;
-        self.data[dense_index as usize] = MaybeUninit::new(component);
     }
 
     fn remove(&mut self, index: usize) -> bool {
@@ -230,33 +259,41 @@ impl<T> ComponentStorage<T> {
             None => return false,
         };
 
-        unsafe {
-            let comp = std::ptr::read(ptr);
-            drop(comp);
-        }
-
+        // Swap-remove the component + entry in dense array
         let dense_index = self.sparse[index];
 
-        self.sparse[index] = std::u32::MAX;
-        self.dense[dense_index as usize] = std::u32::MAX;
+        if self.dense.len() == 1 {
+            self.dense.clear();
+            self.data.clear();
+        } else {
+            self.dense.swap_remove(dense_index as usize);
+            self.data.swap_remove(dense_index as usize);
+        }
 
-        self.free.push(dense_index);
+        self.sparse[self.dense[dense_index as usize] as usize] = dense_index;
 
         true
     }
 
-    fn find_new_dense_index(&mut self) -> u32 {
-        if self.free.is_empty() {
-            self.dense.push(std::u32::MAX);
-            (self.dense.len() - 1) as u32
-        } else {
-            self.free.remove(0)
+    fn clear(&mut self) {
+        // Drop all components
+        for (index, dense_index) in self.sparse.iter().copied().enumerate() {
+            if self.dense[dense_index as usize] == index as u32 {
+                unsafe {
+                    let _comp = ptr::read(self.data[dense_index as usize].get());
+                }
+            }
         }
+
+        self.sparse
+            .iter_mut()
+            .chain(self.dense.iter_mut())
+            .for_each(|x| *x = std::u32::MAX);
     }
 
     fn extend_if_necessary(&mut self, index: usize) {
-        if index > self.sparse.len() {
-            let to_add = self.sparse.len() - index + 1;
+        if index >= self.sparse.len() {
+            let to_add = index - self.sparse.len() + 1;
             self.sparse.extend(iter::repeat(std::u32::MAX).take(to_add));
         }
     }

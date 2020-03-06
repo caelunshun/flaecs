@@ -1,4 +1,5 @@
 //! Tests taken from `hecs`, licensed under Apache-2.0.
+//! Some modifications made.
 
 // Copyright 2019 Google LLC
 //
@@ -34,15 +35,15 @@ fn despawn() {
     let mut world = World::new();
     let e = world.spawn(("abc", 123));
     let f = world.spawn(("def", 456));
-    assert_eq!(world.query::<()>().iter().count(), 2);
+    // assert_eq!(world.query::<()>().iter().count(), 2);
     world.despawn(e).unwrap();
-    assert_eq!(world.query::<()>().iter().count(), 1);
+    // assert_eq!(world.query::<()>().iter().count(), 1);
     assert!(world.get::<&str>(e).is_err());
     assert!(world.get::<i32>(e).is_err());
     assert_eq!(*world.get::<&str>(f).unwrap(), "def");
     assert_eq!(*world.get::<i32>(f).unwrap(), 456);
 }
-
+/*
 #[test]
 fn query_all() {
     let mut world = World::new();
@@ -240,16 +241,26 @@ fn bad_bundle_derive() {
     let mut world = World::new();
     world.spawn(Foo { x: 42, y: 42 });
 }
-
+*/
 #[test]
 #[cfg_attr(miri, ignore)]
 fn spawn_many() {
     let mut world = World::new();
     const N: usize = 100_000;
-    for _ in 0..N {
-        world.spawn((42u128,));
+    let mut ents = vec![];
+    for i in 0..N {
+        ents.push(world.spawn((i as u128,)));
+        assert_eq!(*world.get::<u128>(ents[i]).unwrap(), i as u128);
     }
-    assert_eq!(world.iter().count(), N);
+    assert_eq!(world.size(), N);
+
+    for e in ents {
+        assert_eq!(*world.get::<u128>(e).unwrap(), e.index() as u128);
+        world.despawn(e).unwrap();
+        assert!(world.get::<u128>(e).is_err());
+    }
+
+    assert_eq!(world.size(), 0);
 }
 
 #[test]
@@ -258,9 +269,9 @@ fn clear() {
     world.spawn(("abc", 123));
     world.spawn(("def", 456, true));
     world.clear();
-    assert_eq!(world.iter().count(), 0);
+    assert_eq!(world.size(), 0);
 }
-
+/*
 #[test]
 #[should_panic(expected = "twice on the same borrow")]
 fn alias() {
@@ -271,14 +282,14 @@ fn alias() {
     let _a = q.iter().collect::<Vec<_>>();
     let _b = q.iter().collect::<Vec<_>>();
 }
-
+*/
 #[test]
 fn remove_missing() {
     let mut world = World::new();
     let e = world.spawn(("abc", 123));
-    assert!(world.remove_one::<bool>(e).is_err());
+    assert!(world.remove::<bool>(e).is_err());
 }
-
+/*
 #[test]
 fn reserve() {
     let mut world = World::new();
@@ -331,3 +342,4 @@ fn query_batched() {
     assert!(entities.contains(&b));
     assert!(entities.contains(&c));
 }
+*/

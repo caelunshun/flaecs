@@ -1,29 +1,31 @@
-use crate::{Entity, World};
+use crate::{Entity, Result, World};
 
 pub trait Component: Send + Sync + 'static {}
 impl<T> Component for T where T: Send + Sync + 'static {}
 
 pub trait ComponentBundle {
-    fn add_to(self, world: &mut World, entity: Entity);
+    fn add_to(self, world: &mut World, entity: Entity) -> Result<()>;
 }
 
 impl<A> ComponentBundle for (A,)
 where
     A: Component,
 {
-    fn add_to(self, world: &mut World, entity: Entity) {
-        world.add(entity, self);
+    fn add_to(self, world: &mut World, entity: Entity) -> Result<()> {
+        world.add(entity, self.0)
     }
 }
 
 macro_rules! impl_bundle {
     ($($name:ident),* ; $($idx:tt),*) => {
         impl<$($name: Component),*> ComponentBundle for ($($name,)*) {
-            fn add_to(self, world: &mut World, entity: Entity) {
+            fn add_to(self, world: &mut World, entity: Entity) -> Result<()> {
                 $(
                     let x = self.$idx;
-                    world.add(entity, x);
+                    world.add(entity, x)?;
                 )*
+
+                Ok(())
             }
         }
     }
